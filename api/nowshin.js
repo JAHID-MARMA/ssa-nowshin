@@ -16,7 +16,6 @@
 const DEFAULT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
 const OR_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const RETRY_SLEEPS_MS = [0, 5000, 12000]; // try up to 3 times with short pauses
-const ALLOWED_ORIGINS = ['https://ssa.42web.io', 'https://www.ssa.42web.io'];
 
 /* ---------------- Manager Charter (human voice, Founder order 2026-10-21) ---------------- */
 const CHARTER = `You are Nowshin Jannat, the Customer Manager of Self Scale Academy —
@@ -354,6 +353,83 @@ async function getLiveCourseBlock() {
   }
 }
 
+/* -------- Live updates: quiz rounds + site notices --------
+   The live course block above covers courses only. Customers also ask
+   about the quiz competition and notices, so fetch those from Supabase
+   too (public anon key, read-only) and append them as a LIVE UPDATES
+   block. Cached 5 minutes in memory. ANY failure quietly falls back
+   to the previous block (or nothing) — never blocks the reply. */
+let liveUpdatesCache = { at: 0, block: '' };
+
+async function fetchSupabase(path) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  try {
+    const res = await fetch(SB_URL + path, {
+      headers: { apikey: SB_ANON_KEY, Authorization: 'Bearer ' + SB_ANON_KEY },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function dhakaTime(iso) {
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      timeZone: 'Asia/Dhaka',
+      day: 'numeric', month: 'short',
+      hour: 'numeric', minute: '2-digit', hour12: true,
+    });
+  } catch {
+    return String(iso || '');
+  }
+}
+
+async function getLiveUpdatesBlock() {
+  const now = Date.now();
+  if (now - liveUpdatesCache.at < 5 * 60 * 1000) return liveUpdatesCache.block;
+  const nowIso = new Date(now).toISOString();
+  const [rounds, notices] = await Promise.all([
+    fetchSupabase(
+      '/rest/v1/quiz_competitions?select=title_en,title_bn,starts_at,fee' +
+      '&starts_at=gte.' + encodeURIComponent(nowIso) +
+      '&order=starts_at&limit=3'
+    ),
+    fetchSupabase(
+      '/rest/v1/site_notices?select=title,detail&is_active=eq.true' +
+      '&order=created_at.desc&limit=5'
+    ),
+  ]);
+  const parts = [];
+  if (Array.isArray(rounds) && rounds.length) {
+    const lines = rounds.map((r) => {
+      const name = r.title_en || r.title_bn || 'Quiz round';
+      const fee = r.fee ? ', fee ' + r.fee + ' taka' : ', free entry';
+      return '- ' + name + ' — ' + dhakaTime(r.starts_at) + ' Dhaka' + fee + '.';
+    });
+    parts.push('Upcoming quiz competition rounds:\n' + lines.join('\n'));
+  }
+  if (Array.isArray(notices) && notices.length) {
+    const lines = notices.map((n) => {
+      const detail = n.detail ? ': ' + n.detail : '';
+      return '- ' + (n.title || '') + detail;
+    });
+    parts.push('Latest notices:\n' + lines.join('\n'));
+  }
+  const block = parts.length
+    ? '\n\nLIVE UPDATES (read from the Academy database just now):\n' +
+      parts.join('\n') +
+      '\nUse these live facts when a customer asks about the quiz competition or notices. When they ask about a round, give its date, time and fee from here.'
+    : '';
+  liveUpdatesCache = { at: now, block };
+  return block;
+}
+
 /* ---------------- request handling ---------------- */
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -389,7 +465,8 @@ export default async function handler(req, res) {
   msg = msg.slice(0, 500);
 
   const liveBlock = await getLiveCourseBlock();
-  const messages = [{ role: 'system', content: CHARTER + CHARTER_PRO + liveBlock }];
+  const updatesBlock = await getLiveUpdatesBlock();
+  const messages = [{ role: 'system', content: CHARTER + CHARTER_PRO + liveBlock + updatesBlock }];
   const hist = Array.isArray(input.history) ? input.history.slice(-8) : [];
   for (const h of hist) {
     /* Tolerant parsing: the new LMS widget sends {role, content} with
